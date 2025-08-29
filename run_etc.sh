@@ -1,7 +1,57 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE_NAME="nelsonnunes/girmos-etc-app:latest"
+IMAGE_REPO="nelsonnunes/girmos-datasim"
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") [-h|--help] [stable|edge|X.Y.Z|local|stop]
+
+No args      Same as 'stable'
+stable       Use tag :latest, pull & run/reuse
+edge         Use tag :edge, pull & run/reuse
+X.Y.Z        Use a specific version tag :X.Y.Z, pull & run/reuse
+local        Skip 'docker pull', use the locally cached image
+stop         Stop any running container(s) of ${IMAGE_REPO} (all tags).
+EOF
+}
+
+# Help
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+# Select tag/mode (default: stable -> :latest)
+TAG="latest"
+case "${1:-stable}" in
+  stable|"")
+    TAG="latest"
+    ;;
+  edge)
+    TAG="edge"
+    ;;
+  local|stop)
+    # handled later; default tag remains :latest
+    ;;
+  *)
+    # Check if argument is a valid semver X.Y.Z
+    if [[ "${1}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      TAG="${1}"
+    else
+      echo "Error: Unknown option '${1}'. Expected one of: stable|edge|<X.Y.Z>|local|stop" >&2
+      usage; exit 1
+    fi
+    ;;
+esac
+
+IMAGE_NAME="${IMAGE_REPO}:${TAG}"
+
+SKIP_PULL=false
+if [[ "${1:-}" == "local" ]]; then
+  SKIP_PULL=true
+fi
 
 # Check if Docker is installed
 ensure_docker_installed() {
@@ -171,31 +221,23 @@ ensure_docker_installed
 # Ensure the Docker daemon is running
 ensure_docker_running
 
-# Check for running containers
-running_id=$(docker ps --filter "ancestor=$IMAGE_NAME" --format '{{.ID}}' || true)
-
-# Handle stop command
+# Handle stop command (stop all tags)
 if [[ "${1:-}" == "stop" ]]; then
-  if [[ -n "$running_id" ]]; then
-    echo "Stopping containers for $IMAGE_NAME..."
-    docker kill $running_id >/dev/null || true
-    echo "Stopped: $running_id"
+  all_running_ids=$(docker ps --filter "ancestor=${IMAGE_REPO}" --format '{{.ID}}' | tr '\n' ' ' || true)
+  if [[ -n "${all_running_ids// }" ]]; then
+    echo "Stopping containers for ${IMAGE_REPO} (all tags)..."
+    docker kill $all_running_ids >/dev/null || true
+    echo "Stopped: $all_running_ids"
   else
-    echo "No running containers for $IMAGE_NAME."
+    echo "No running containers for ${IMAGE_REPO}."
   fi
   exit 0
-fi
-
-# Optional: skip_update command to skip pulling the latest image
-SKIP_UPDATE=false
-if [[ "${1:-}" == "skip_update" ]]; then
-  SKIP_UPDATE=true
 fi
 
 # Pull latest version
 before_id="$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME" 2>/dev/null || true)"
 image_updated=false
-if ! $SKIP_UPDATE; then
+if ! $SKIP_PULL; then
   echo "Pulling latest image: $IMAGE_NAME"
   if docker pull "$IMAGE_NAME" >/dev/null; then
     after_id="$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME" 2>/dev/null || true)"
@@ -212,6 +254,7 @@ else
 fi
 
 # If image updated, kill any running containers of this image
+running_id=$(docker ps --filter "ancestor=$IMAGE_NAME" --format '{{.ID}}' || true)
 if $image_updated; then
   if [[ -n "${running_id}" ]]; then
     docker kill $running_id >/dev/null || true
@@ -229,53 +272,43 @@ COMMON_OPTS=(
 )
 
 # Run docker
-if [[ "${1:-}" == "--it" ]]; then
-  if [[ -n "$running_id" ]]; then
-    echo "Error: A container from $IMAGE_NAME is already running (ID: $running_id)."
-    echo "Stop it with: docker kill $running_id"
-    exit 1
-  fi
+# Reuse existing container if not updated; otherwise start new
+if [[ -n "$running_id" ]]; then
+  container_id="$running_id"
+  echo "Reusing running container: $container_id"
 
-  docker run -it --rm "${COMMON_OPTS[@]}" "$IMAGE_NAME"
-else
-  # Reuse existing container if not updated; otherwise start new
-  if [[ -n "$running_id" ]]; then
-    container_id="$running_id"
-    echo "Reusing running container: $container_id"
-
-    # Ask Docker which host port maps to container 8888
-    mapped="$(docker port "$container_id" 8888/tcp 2>/dev/null | head -n1 || true)"
-    if [[ -n "$mapped" ]]; then
-      # mapped looks like "127.0.0.1:49213" or "0.0.0.0:49213"
-      HOST_PORT="${mapped##*:}"
-    else
-      # If container was started without publishing (unlikely here), fall back
-      HOST_PORT=8888
-    fi
+  # Ask Docker which host port maps to container 8888
+  mapped="$(docker port "$container_id" 8888/tcp 2>/dev/null | head -n1 || true)"
+  if [[ -n "$mapped" ]]; then
+    # mapped looks like "127.0.0.1:49213" or "0.0.0.0:49213"
+    HOST_PORT="${mapped##*:}"
   else
-    container_id=$(docker run -d --rm "${COMMON_OPTS[@]}" "$IMAGE_NAME")
-    echo "Container started: $container_id"
-    echo "Waiting for Jupyter to start..."
+    # If container was started without publishing (unlikely here), fall back
+    HOST_PORT=8888
   fi
-
-  echo "Use '$0 stop' or 'docker kill $container_id' to stop it manually."
-
-  # Grab the first URL with token from logs
-  for i in {1..30}; do
-    url=$(docker logs "$container_id" 2>&1 \
-          | grep -Eo 'http://(127\.0\.0\.1|0\.0\.0\.0):8888/[^ ]*' \
-          | head -n1 || true)
-    if [[ -n "$url" ]]; then
-      break
-    fi
-    sleep 2
-  done
-
-  if [[ -z "$url" ]]; then
-    echo "Could not find Jupyter URL in logs. Run 'docker logs $container_id' manually."
-    exit 1
-  fi
-
-  url=$(echo "$url" | sed -E "s#http://(127\.0\.0\.1|0\.0\.0\.0):[0-9]+/#http://localhost:${HOST_PORT}/#")
-  open_in_browser "$url"
+else
+  container_id=$(docker run -d --rm "${COMMON_OPTS[@]}" "$IMAGE_NAME")
+  echo "Container started: $container_id"
+  echo "Waiting for Jupyter to start..."
 fi
+
+echo "Use '$0 stop' or 'docker kill $container_id' to stop it manually."
+
+# Grab the first URL with token from logs
+for i in {1..30}; do
+  url=$(docker logs "$container_id" 2>&1 \
+        | grep -Eo 'http://(127\.0\.0\.1|0\.0\.0\.0):8888/[^ ]*' \
+        | head -n1 || true)
+  if [[ -n "$url" ]]; then
+    break
+  fi
+  sleep 2
+done
+
+if [[ -z "$url" ]]; then
+  echo "Could not find Jupyter URL in logs. Run 'docker logs $container_id' manually."
+  exit 1
+fi
+
+url=$(echo "$url" | sed -E "s#http://(127\.0\.0\.1|0\.0\.0\.0):[0-9]+/#http://localhost:${HOST_PORT}/#")
+open_in_browser "$url"
