@@ -223,7 +223,10 @@ ensure_docker_running
 
 # Handle stop command (stop all tags)
 if [[ "${1:-}" == "stop" ]]; then
-  all_running_ids=$(docker ps --filter "ancestor=${IMAGE_REPO}" --format '{{.ID}}' | tr '\n' ' ' || true)
+  all_running_ids=$(docker ps --format '{{.ID}} {{.Image}}' \
+    | awk -v repo="$IMAGE_REPO" '$2 ~ "^"repo"(:|@)" {print $1}' \
+    | tr '\n' ' ' || true)
+
   if [[ -n "${all_running_ids// }" ]]; then
     echo "Stopping containers for ${IMAGE_REPO} (all tags)..."
     docker kill $all_running_ids >/dev/null || true
